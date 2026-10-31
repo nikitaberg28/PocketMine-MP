@@ -51,8 +51,10 @@ use pocketmine\thread\ThreadCrashException;
 use pocketmine\timings\Timings;
 use pocketmine\utils\Utils;
 use function bin2hex;
+use function count;
 use function filter_var;
 use function implode;
+use function microtime;
 use function ord;
 use function random_bytes;
 use function spl_object_id;
@@ -62,6 +64,8 @@ use const FILTER_VALIDATE_IP;
 final class NetherNetInterface implements AdvancedNetworkInterface{
 
 	private const CONSUMPTION_REPORT_INTERVAL = 1024;
+
+	private const CLOSE_DELAY = 1.5;
 
 	private NetherNetThread $thread;
 
@@ -79,6 +83,9 @@ final class NetherNetInterface implements AdvancedNetworkInterface{
 
 	/** @phpstan-var (\Closure(NetworkSession, string) : void)|null */
 	private ?\Closure $unreliablePacketHandler = null;
+
+	/** @phpstan-var array<int, float> microtime() deadlines by session ID for sessions waiting to be closed */
+	private array $pendingClose = [];
 
 	/** @phpstan-var array<int, NetherNetNegotiation> */
 	private array $pendingOffers = [];
@@ -221,6 +228,16 @@ final class NetherNetInterface implements AdvancedNetworkInterface{
 				throw new ThreadCrashException("NetherNet crashed", $crashInfo);
 			}
 			throw new \RuntimeException("NetherNet thread crashed without crash information");
+		}
+
+		if(count($this->pendingClose) > 0){
+			$now = microtime(true);
+			foreach($this->pendingClose as $sessionId => $deadline){
+				if($now >= $deadline){
+					unset($this->pendingClose[$sessionId]);
+					$this->toThread->write(NetherNetIpc::closeSession($sessionId));
+				}
+			}
 		}
 	}
 
@@ -395,7 +412,8 @@ final class NetherNetInterface implements AdvancedNetworkInterface{
 	public function close(int $sessionId) : void{
 		if(isset($this->sessions[$sessionId])){
 			unset($this->sessionIds[spl_object_id($this->sessions[$sessionId])], $this->sessions[$sessionId]);
-			$this->toThread->write(NetherNetIpc::closeSession($sessionId));
+			//the transport is closed a moment later (see CLOSE_DELAY in 68 line) so the client can finish handling the last packets
+			$this->pendingClose[$sessionId] = microtime(true) + self::CLOSE_DELAY;
 		}
 	}
 
@@ -406,6 +424,10 @@ final class NetherNetInterface implements AdvancedNetworkInterface{
 
 	public function shutdown() : void{
 		$this->shutDown = true;
+		foreach($this->pendingClose as $sessionId => $_){
+			$this->toThread->write(NetherNetIpc::closeSession($sessionId));
+		}
+		$this->pendingClose = [];
 		$pendingOffers = $this->pendingOffers;
 		$this->pendingOffers = [];
 		foreach($pendingOffers as $negotiation){
